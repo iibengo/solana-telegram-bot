@@ -13,6 +13,9 @@ const retrieveEnvVariable = (variableName: string, logger: Logger) => {
   }
   return variable;
 };
+//telegram
+export const TELEGRAM_PK = retrieveEnvVariable('TELEGRAM_PK', logger);
+export const TELEGRAM_CHAT_ID = retrieveEnvVariable('TELEGRAM_CHAT_ID', logger);
 
 // Wallet
 export const PRIVATE_KEY = retrieveEnvVariable('PRIVATE_KEY', logger);

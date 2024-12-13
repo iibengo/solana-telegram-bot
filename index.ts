@@ -23,6 +23,7 @@ import {
   MIN_POOL_SIZE,
   QUOTE_AMOUNT,
   PRIVATE_KEY,
+  TELEGRAM_PK,
   USE_SNIPE_LIST,
   ONE_TOKEN_AT_A_TIME,
   AUTO_SELL_DELAY,
@@ -49,6 +50,7 @@ import {
 import { version } from './package.json';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
+import telegram from 'node-telegram-bot-api';
 
 const connection = new Connection(RPC_ENDPOINT, {
   wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
@@ -162,6 +164,23 @@ const runListener = async () => {
 
   const wallet = getWallet(PRIVATE_KEY.trim());
   const quoteToken = getToken(QUOTE_MINT);
+ console.log('sigue con tbot');
+  const tbot = new telegram(TELEGRAM_PK, { polling: true }); //id 5923575999
+  const msgBot = `
+  📢 Iniciando bot, buscando nuevos tokens... 
+
+    ℹ️ Filtros:
+
+      🟢 Check if Freezable: Y
+      🟢 Check Mint renounced: Y
+      🔴 Check if Mutable: N
+      🔴 Check if Burned: N
+      🔴 Check Socials: N
+      💰 Min pool size: 3.1 
+      💰 Max pool size: 75 
+        `;
+
+ // tbot.sendMessage('-4728688044',msgBot);
   const botConfig = <BotConfig>{
     wallet,
     quoteAta: getAssociatedTokenAddressSync(quoteToken.mint, wallet.publicKey),
@@ -225,18 +244,19 @@ const runListener = async () => {
 
     if (!exists && poolOpenTime > runTimestamp) {
       poolCache.save(updatedAccountInfo.accountId.toString(), poolState);
-      await bot.buy(updatedAccountInfo.accountId, poolState);
+      await bot.buy(updatedAccountInfo.accountId, poolState, tbot);
     }
   });
 
   listeners.on('wallet', async (updatedAccountInfo: KeyedAccountInfo) => {
     const accountData = AccountLayout.decode(updatedAccountInfo.accountInfo.data);
-
+    console.log('wallet-changed', accountData.owner, accountData.mint);
+    console.log('quoteToken', quoteToken.mint);
     if (accountData.mint.equals(quoteToken.mint)) {
       return;
     }
 
-    await bot.sell(updatedAccountInfo.accountId, accountData);
+    //  await bot.sell(updatedAccountInfo.accountId, accountData);
   });
 
   printDetails(wallet, quoteToken, bot);
