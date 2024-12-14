@@ -1,60 +1,26 @@
 import {
-  ComputeBudgetProgram,
   Connection,
-  Keypair,
   PublicKey,
-  TransactionMessage,
-  VersionedTransaction,
 } from '@solana/web3.js';
 import {
-  createAssociatedTokenAccountIdempotentInstruction,
-  createCloseAccountInstruction,
   getAccount,
   getAssociatedTokenAddress,
   RawAccount,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import {  LiquidityPoolKeysV4, LiquidityStateV4, Token, TokenAmount } from '@raydium-io/raydium-sdk';
 import { MarketCache, PoolCache, SnipeListCache } from './cache';
 import { PoolFilters } from './filters';
 import { TransactionExecutor } from './transactions';
-import { createPoolKeys, logger, NETWORK, sleep } from './helpers';
+import { createPoolKeys, logger, sleep } from './helpers';
 import { Mutex } from 'async-mutex';
-import BN from 'bn.js';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
-import telegram from 'node-telegram-bot-api';
-
-export interface BotConfig {
-  wallet: Keypair;
-  checkRenounced: boolean;
-  checkFreezable: boolean;
-  checkBurned: boolean;
-  minPoolSize: TokenAmount;
-  maxPoolSize: TokenAmount;
-  quoteToken: Token;
-  quoteAmount: TokenAmount;
-  quoteAta: PublicKey;
-  oneTokenAtATime: boolean;
-  useSnipeList: boolean;
-  autoSell: boolean;
-  autoBuyDelay: number;
-  telegramChatId: string;
-  autoSellDelay: number;
-  maxBuyRetries: number;
-  maxSellRetries: number;
-  unitLimit: number;
-  unitPrice: number;
-  takeProfit: number;
-  stopLoss: number;
-  buySlippage: number;
-  sellSlippage: number;
-  priceCheckInterval: number;
-  priceCheckDuration: number;
-  filterCheckInterval: number;
-  filterCheckDuration: number;
-  consecutiveMatchCount: number;
-}
+import { TelegramService } from './telegram';
+import { BotConfig } from './models';
+import { SwapService } from './cross/swap';
+import { FilterMatch } from './bot/filter-match';
+import { PriceMatch } from './bot/price-match';
 
 export class Bot {
   private readonly poolFilters: PoolFilters;
@@ -104,7 +70,7 @@ export class Bot {
     return true;
   }
 
-  public async buy(accountId: PublicKey, poolState: LiquidityStateV4, tbot: telegram) {
+  public async buy(accountId: PublicKey, poolState: LiquidityStateV4) {
     logger.trace({ mint: poolState.baseMint }, `Processing new pool...`);
 
     if (this.config.useSnipeList && !this.snipeListCache?.isInList(poolState.baseMint.toString())) {
@@ -137,23 +103,23 @@ export class Bot {
       const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(accountId, poolState, market);
 
       if (!this.config.useSnipeList) {
-        const match = await this.filterMatch(poolKeys);
+        const match = await FilterMatch.filterMatch(poolKeys,this.poolFilters,this.config);
 
         if (!match) {
           logger.trace({ mint: poolKeys.baseMint.toString() }, `Skipping buy because pool doesn't match filters`);
           return;
         }
       }
-     
+
       const msgBot = `
           🆕 ${poolKeys.baseMint.toString()} 
           📊  https://www.dextools.io/app/es/solana/pair-explorer/${poolKeys.baseMint.toString()}
           🔄  https://raydium.io/swap/?inputMint=${poolKeys.baseMint.toString()}&outputMint=sol
           🛡️  https://rugcheck.xyz/tokens/${poolKeys.baseMint.toString()}
         `;
-   
-      tbot.sendMessage('-4728688044', msgBot);
-   //this.processSwap(poolState,poolKeys,mintAta)
+      //  TelegramService.sendMessage(msgBot)
+
+      await SwapService.processBuy(poolState,poolKeys,mintAta,this.connection,this.txExecutor,this.config)
     } catch (error) {
       logger.error({ mint: poolState.baseMint.toString(), error }, `Failed to buy token`);
     } finally {
@@ -162,54 +128,7 @@ export class Bot {
       }
     }
   }
-private async processSwap (poolState:any,poolKeys:any,mintAta:any){
-  for (let i = 0; i < this.config.maxBuyRetries; i++) {
-    try {
-      logger.info(
-        { mint: poolState.baseMint.toString() },
-        `Send buy transaction attempt: ${i + 1}/${this.config.maxBuyRetries}`,
-      );
-      const tokenOut = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
-      const result = await this.swap(
-        poolKeys,
-        this.config.quoteAta,
-        mintAta,
-        this.config.quoteToken,
-        tokenOut,
-        this.config.quoteAmount,
-        this.config.buySlippage,
-        this.config.wallet,
-        'buy',
-      );
-
-      if (result.confirmed) {
-        logger.info(
-          {
-            mint: poolState.baseMint.toString(),
-            signature: result.signature,
-            url: `https://solscan.io/tx/${result.signature}?cluster=${NETWORK}`,
-          },
-          `Confirmed buy tx`,
-        );
-
-        break;
-      }
-
-      logger.info(
-        {
-          mint: poolState.baseMint.toString(),
-          signature: result.signature,
-          error: result.error,
-        },
-        `Error confirming buy tx`,
-      );
-    } catch (error) {
-      logger.debug({ mint: poolState.baseMint.toString(), error }, `Error confirming buy transaction`);
-    }
-  }
-}
   public async sell(accountId: PublicKey, rawAccount: RawAccount) {
-    console.log('--------------------entra sell', this.sellExecutionCount++);
     let shouldSell = false;
     let sellExecutionCount = 1;
     do {
@@ -238,44 +157,19 @@ private async processSwap (poolState:any,poolKeys:any,mintAta:any){
         const market = await this.marketStorage.get(poolData.state.marketId.toString());
         const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(new PublicKey(poolData.id), poolData.state, market);
 
-        shouldSell = await this.priceMatch(tokenAmountIn, poolKeys);
-        console.log('price check-------------------', shouldSell);
-        if (shouldSell) {
+        shouldSell = await PriceMatch.priceMatch(tokenAmountIn, poolKeys,this.connection,this.config);
+       if (shouldSell) {
           try {
-            logger.info({ mint: rawAccount.mint }, `Send sell transaction attempt `);
-
-            const result = await this.swap(
+            await SwapService.processSell(
+              rawAccount,
               poolKeys,
               accountId,
-              this.config.quoteAta,
               tokenIn,
-              this.config.quoteToken,
               tokenAmountIn,
-              this.config.sellSlippage,
-              this.config.wallet,
-              'sell',
+              this.connection,
+              this.txExecutor,
+              this.config,
             );
-
-            if (result.confirmed) {
-              logger.info(
-                {
-                  dex: `https://dexscreener.com/solana/${rawAccount.mint.toString()}?maker=${this.config.wallet.publicKey}`,
-                  mint: rawAccount.mint.toString(),
-                  signature: result.signature,
-                  url: `https://solscan.io/tx/${result.signature}?cluster=${NETWORK}`,
-                },
-                `Confirmed sell tx`,
-              );
-            } else {
-              logger.info(
-                {
-                  mint: rawAccount.mint.toString(),
-                  signature: result.signature,
-                  error: result.error,
-                },
-                `Error confirming sell tx`,
-              );
-            }
           } catch (error) {
             logger.debug({ mint: rawAccount.mint.toString(), error }, `Error confirming sell transaction`);
           }
@@ -293,178 +187,5 @@ private async processSwap (poolState:any,poolKeys:any,mintAta:any){
         await sleep(this.config.autoSellDelay);
       }
     } while (!shouldSell || this.config.maxSellRetries > sellExecutionCount);
-  }
-
-  // noinspection JSUnusedLocalSymbols
-  private async swap(
-    poolKeys: LiquidityPoolKeysV4,
-    ataIn: PublicKey,
-    ataOut: PublicKey,
-    tokenIn: Token,
-    tokenOut: Token,
-    amountIn: TokenAmount,
-    slippage: number,
-    wallet: Keypair,
-    direction: 'buy' | 'sell',
-  ) {
-    const slippagePercent = new Percent(slippage, 100);
-    const poolInfo = await Liquidity.fetchInfo({
-      connection: this.connection,
-      poolKeys,
-    });
-
-    const computedAmountOut = Liquidity.computeAmountOut({
-      poolKeys,
-      poolInfo,
-      amountIn,
-      currencyOut: tokenOut,
-      slippage: slippagePercent,
-    });
-
-    const latestBlockhash = await this.connection.getLatestBlockhash();
-    const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-      {
-        poolKeys: poolKeys,
-        userKeys: {
-          tokenAccountIn: ataIn,
-          tokenAccountOut: ataOut,
-          owner: wallet.publicKey,
-        },
-        amountIn: amountIn.raw,
-        minAmountOut: computedAmountOut.minAmountOut.raw,
-      },
-      poolKeys.version,
-    );
-
-    const messageV0 = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latestBlockhash.blockhash,
-      instructions: [
-        ...(this.isWarp || this.isJito
-          ? []
-          : [
-              ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
-              ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.unitLimit }),
-            ]),
-        ...(direction === 'buy'
-          ? [
-              createAssociatedTokenAccountIdempotentInstruction(
-                wallet.publicKey,
-                ataOut,
-                wallet.publicKey,
-                tokenOut.mint,
-              ),
-            ]
-          : []),
-        ...innerTransaction.instructions,
-        ...(direction === 'sell' ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []),
-      ],
-    }).compileToV0Message();
-
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet, ...innerTransaction.signers]);
-
-    return this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
-  }
-
-  private async filterMatch(poolKeys: LiquidityPoolKeysV4) {
-    if (this.config.filterCheckInterval === 0 || this.config.filterCheckDuration === 0) {
-      return true;
-    }
-
-    const timesToCheck = this.config.filterCheckDuration / this.config.filterCheckInterval;
-    let timesChecked = 0;
-    let matchCount = 0;
-
-    do {
-      try {
-        const shouldBuy = await this.poolFilters.execute(poolKeys);
-
-        if (shouldBuy) {
-          matchCount++;
-
-          if (this.config.consecutiveMatchCount <= matchCount) {
-            logger.debug(
-              { mint: poolKeys.baseMint.toString() },
-              `Filter match ${matchCount}/${this.config.consecutiveMatchCount}`,
-            );
-            return true;
-          }
-        } else {
-          matchCount = 0;
-        }
-
-        await sleep(this.config.filterCheckInterval);
-      } finally {
-        timesChecked++;
-      }
-    } while (timesChecked < timesToCheck);
-
-    return false;
-  }
-
-  private async priceMatch(amountIn: TokenAmount, poolKeys: LiquidityPoolKeysV4): Promise<boolean> {
-    console.log('price----------match');
-    if (this.config.priceCheckDuration === 0 || this.config.priceCheckInterval === 0) {
-      return false;
-    }
-
-    const timesToCheck = this.config.priceCheckDuration / this.config.priceCheckInterval;
-    let shouldSell = false;
-    const profitFraction = this.config.quoteAmount.mul(this.config.takeProfit).numerator.div(new BN(100));
-    const profitAmount = new TokenAmount(this.config.quoteToken, profitFraction, true);
-    const takeProfit = this.config.quoteAmount.add(profitAmount);
-
-    const lossFraction = this.config.quoteAmount.mul(this.config.stopLoss).numerator.div(new BN(100));
-    const lossAmount = new TokenAmount(this.config.quoteToken, lossFraction, true);
-    const stopLoss = this.config.quoteAmount.subtract(lossAmount);
-    const slippage = new Percent(this.config.sellSlippage, 100);
-    let timesChecked = 0;
-    console.log('imesChecked < timesToCheck || shouldSell');
-    do {
-      try {
-        const poolInfo = await Liquidity.fetchInfo({
-          connection: this.connection,
-          poolKeys,
-        });
-        console.log('do.while');
-        const amountOut = Liquidity.computeAmountOut({
-          poolKeys,
-          poolInfo,
-          amountIn: amountIn,
-          currencyOut: this.config.quoteToken,
-          slippage,
-        }).amountOut;
-        console.log(
-          `Take profit: ${takeProfit.toFixed()} | Stop loss: ${stopLoss.toFixed()} | Current: ${amountOut.toFixed()}`,
-        );
-        logger.debug(
-          { mint: poolKeys.baseMint.toString() },
-          `Take profit: ${takeProfit.toFixed()} | Stop loss: ${stopLoss.toFixed()} | Current: ${amountOut.toFixed()}`,
-        );
-        console.log(`Take profit: ${takeProfit.toFixed()} | amountOut : ${amountOut}`);
-        if (amountOut.lt(stopLoss)) {
-          return true;
-        }
-
-        if (amountOut.gt(takeProfit)) {
-          return true;
-        }
-        console.log('do.while2-----------------------------', timesChecked);
-        await sleep(this.config.priceCheckInterval);
-      } catch (e) {
-        logger.trace({ mint: poolKeys.baseMint.toString(), e }, `Failed to check token price`);
-      } finally {
-        timesChecked++;
-      }
-      console.log(
-        'do.while3-----------------------------',
-        timesChecked,
-        timesChecked < timesToCheck,
-        timesChecked < timesToCheck || !shouldSell,
-        timesToCheck,
-      );
-    } while (timesChecked < timesToCheck);
-    return shouldSell;
   }
 }
